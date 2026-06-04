@@ -1,0 +1,22 @@
+# ─── Local config (credentials) ─────────────────────────────────────────────
+# config.ps1 holds real tenant values — never commit it.
+# Commit config.sample.ps1 (placeholder values) instead.
+config.ps1
+
+# ─── Script output ───────────────────────────────────────────────────────────
+DLMemberReport_*.csv
+DLOwnerAssignment_*.csv
+
+# ─── Certificates / secrets ──────────────────────────────────────────────────
+*.pfx
+*.cer
+*.key
+*.secret
+
+# ─── OS / editor noise ───────────────────────────────────────────────────────
+Thumbs.db
+Desktop.ini
+.DS_Store
+*.swp
+.vscode/
+.idea/
