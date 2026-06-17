@@ -80,11 +80,12 @@ Both scripts support three authentication methods, checked in this priority orde
 2. Copy the **Application (client) ID** → this is your `-AppId`
 3. Copy the **Directory (tenant) ID** → this is your `-TenantId`
 
-### Add API permission
+### Add API permissions
 
-| API | Permission | Type |
-|-----|-----------|------|
-| Office 365 Exchange Online | `Exchange.ManageAsApp` | Application |
+| API | Permission | Type | When required |
+|-----|-----------|------|--------------|
+| Office 365 Exchange Online | `Exchange.ManageAsApp` | Application | Always (core functionality) |
+| Microsoft Graph | `Mail.Send` | Application | Only when using `-Notify` to email assigned owners |
 
 After adding: click **Grant admin consent for \<tenant\>**.
 
@@ -322,14 +323,24 @@ Reads the customer-edited CSV and applies `ManagedBy`.
     -InputCsvPath .\DLMemberReport_modified.csv `
     -AppId $cfg.AppId -TenantId $cfg.TenantId -ClientSecret $cfg.ClientSecret -WhatIf
 
-# Apply (Replace mode — correct for ownerless groups)
+# Apply (Append mode — default, adds owners without removing existing ones)
 .\Set-DLOwners.ps1 `
     -InputCsvPath .\DLMemberReport_modified.csv `
     -AppId $cfg.AppId -TenantId $cfg.TenantId -ClientSecret $cfg.ClientSecret
 
-# Append mode — adds owners without removing existing ones
+# Replace mode — overwrites ManagedBy with exactly the IsOwner=1 rows
 .\Set-DLOwners.ps1 `
-    -InputCsvPath .\DLMemberReport_modified.csv -Mode Append `
+    -InputCsvPath .\DLMemberReport_modified.csv -Mode Replace `
+    -AppId $cfg.AppId -TenantId $cfg.TenantId -ClientSecret $cfg.ClientSecret
+
+# Apply and notify each newly assigned owner by email.
+# Always include -AppId/-TenantId/-ClientSecret with -Notify — without them the
+# script falls back to an interactive Microsoft Graph browser auth popup.
+# -NotificationFrom must be a real licensed user mailbox (not a DL or alias);
+# the script validates this upfront and exits with a clear error if not found.
+.\Set-DLOwners.ps1 `
+    -InputCsvPath .\DLMemberReport_modified.csv `
+    -Notify -NotificationFrom $cfg.AdminUPN `
     -AppId $cfg.AppId -TenantId $cfg.TenantId -ClientSecret $cfg.ClientSecret
 ```
 
@@ -338,7 +349,11 @@ Reads the customer-edited CSV and applies `ManagedBy`.
 | Parameter | Required | Default | Description |
 |-----------|----------|---------|-------------|
 | `-InputCsvPath` | **Yes** | — | The customer-edited member report CSV |
-| `-Mode` | No | `Replace` | `Replace` = set ManagedBy to exactly the `IsOwner=1` rows (use when all desired owners are group members). `Append` = add `IsOwner=1` rows to whoever is already in ManagedBy (use when existing owners may not be group members). |
+| `-Mode` | No | `Append` | `Append` = add `IsOwner=1` rows to whoever is already in ManagedBy (default — safe for most scenarios). `Replace` = set ManagedBy to exactly the `IsOwner=1` rows. |
+| `-Notify` | No | — | Send an HTML notification email to each newly assigned owner. Requires app-based auth with `-ClientSecret` and the `Mail.Send` Microsoft Graph application permission. |
+| `-NotificationFrom` | No | `-AdminUPN` value | Sender address for notification emails. **Must be a real, licensed user mailbox** in Exchange Online — DLs, contacts, and non-existent addresses cause a 404 error. Defaults to `-AdminUPN` when not set. Only used with `-Notify`. |
+| `-NotificationSubject` | No | `You have been added as owner of distribution list: {{GroupName}}` | Subject line for notification emails. Supports the same `{{GroupName}}`, `{{GroupEmail}}`, `{{OwnerEmail}}` placeholders as the body template. |
+| `-NotificationTemplatePath` | No | Built-in template | Path to a custom HTML file used as the email body. Supports `{{GroupName}}`, `{{GroupEmail}}`, and `{{OwnerEmail}}` placeholders. Copy `notification-template.html` as a starting point. |
 | `-AuditLogPath` | No | `.\DLOwnerAssignment_<timestamp>.csv` | Audit log output path |
 | `-AppId` | No* | — | Entra app client ID (required for app-based auth) |
 | `-TenantId` | No* | — | Tenant ID or domain (required with `-AppId`) |
@@ -364,13 +379,33 @@ Choosing the right mode:
 
 | Scenario | Mode | Why |
 |---|---|---|
-| All desired owners are group members | `Replace` (default) | Export pre-populates existing owners with `IsOwner=1`; add new ones the same way; result is exactly who you selected |
-| Existing owner is **not** a group member | `Append` | They won't appear in the CSV at all; Append merges the CSV owners with whoever is already in ManagedBy |
+| General use / groups already have some owners | `Append` (default) | Merges CSV owners with existing ManagedBy; no one is accidentally removed |
+| Existing owner is **not** a group member | `Append` (default) | They won't appear in the CSV; Append preserves whoever is already in ManagedBy |
+| Full control — you want the final list to be exactly what's in the CSV | `Replace` | Export pre-populates existing owners with `IsOwner=1`; add new ones the same way; only `IsOwner=1` rows end up in ManagedBy |
 | Remove a specific owner | `Replace` | Set their `IsOwner` to `0` (or leave as `0`); only `IsOwner=1` rows are applied |
 
-> **Replace mode is safe for groups with existing owners** as long as those owners are
-> group members — the export pre-populates their `IsOwner=1` so they are preserved
-> unless you explicitly change it to `0`.
+> **Append is the safe default.** Use `Replace` only when you want full control over the final
+> ManagedBy list and have verified the export captured all existing owners you intend to keep.
+
+**Customising the notification email**
+
+The email body is driven by an HTML template with three placeholders:
+
+| Placeholder | Replaced with |
+|-------------|--------------|
+| `{{GroupName}}` | Display name of the distribution list |
+| `{{GroupEmail}}` | Primary SMTP address of the distribution list |
+| `{{OwnerEmail}}` | Email address of the recipient (the new owner) |
+
+Copy the included `notification-template.html` and edit freely — branding, wording, layout — then point `-NotificationTemplatePath` at your copy. Use `-NotificationSubject` to customise the subject line. The script itself never needs to be touched.
+
+```powershell
+.\Set-DLOwners.ps1 -InputCsvPath .\DLMemberReport_modified.csv `
+    -Notify -NotificationFrom $cfg.AdminUPN `
+    -NotificationSubject 'Action required: you are now owner of {{GroupName}}' `
+    -NotificationTemplatePath .\my-notification-template.html `
+    -AppId $cfg.AppId -TenantId $cfg.TenantId -ClientSecret $cfg.ClientSecret
+```
 
 **Audit log columns**
 
@@ -407,8 +442,13 @@ Choosing the right mode:
 .\Set-DLOwners.ps1 -InputCsvPath .\DLMemberReport_modified.csv `
     -AppId $cfg.AppId -TenantId $cfg.TenantId -ClientSecret $cfg.ClientSecret -WhatIf
 
-# 5. Apply
+# 5a. Apply without notifications
 .\Set-DLOwners.ps1 -InputCsvPath .\DLMemberReport_modified.csv `
+    -AppId $cfg.AppId -TenantId $cfg.TenantId -ClientSecret $cfg.ClientSecret
+
+# 5b. Apply and email each newly assigned owner (requires Mail.Send Graph permission on the app)
+.\Set-DLOwners.ps1 -InputCsvPath .\DLMemberReport_modified.csv `
+    -Notify -NotificationFrom $cfg.AdminUPN `
     -AppId $cfg.AppId -TenantId $cfg.TenantId -ClientSecret $cfg.ClientSecret
 ```
 
@@ -432,8 +472,13 @@ Choosing the right mode:
 .\Set-DLOwners.ps1 -InputCsvPath .\DLMemberReport_modified.csv `
     -AppId $cfg.AppId -TenantId $cfg.TenantId -ClientSecret $cfg.ClientSecret -WhatIf
 
-# 5. Apply
+# 5a. Apply without notifications
 .\Set-DLOwners.ps1 -InputCsvPath .\DLMemberReport_modified.csv `
+    -AppId $cfg.AppId -TenantId $cfg.TenantId -ClientSecret $cfg.ClientSecret
+
+# 5b. Apply and email each newly assigned owner (requires Mail.Send Graph permission on the app)
+.\Set-DLOwners.ps1 -InputCsvPath .\DLMemberReport_modified.csv `
+    -Notify -NotificationFrom $cfg.AdminUPN `
     -AppId $cfg.AppId -TenantId $cfg.TenantId -ClientSecret $cfg.ClientSecret
 ```
 
