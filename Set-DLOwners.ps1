@@ -16,10 +16,10 @@
     - Groups with no eligible owners in the CSV are skipped.
 
     Mode:
-    - Replace (default): ManagedBy is set to exactly the owners in the CSV.
-      Use this for currently-ownerless groups.
-    - Append: The owners in the CSV are added to any existing ManagedBy value.
+    - Append (default): The owners in the CSV are added to any existing ManagedBy value.
       Use this when groups already have owners you want to keep.
+    - Replace: ManagedBy is set to exactly the owners in the CSV.
+      Use this to overwrite all existing owners.
 
     Use -WhatIf to preview all changes without applying them.
     Results are written to a timestamped audit log CSV.
@@ -29,8 +29,31 @@
     Must contain columns: GroupEmail, MemberEmail, MemberIsEligible, IsOwner.
 
 .PARAMETER Mode
-    Replace (default) — replaces ManagedBy entirely with the CSV-designated owners.
-    Append           — adds CSV-designated owners to the existing ManagedBy list.
+    Append (default) — adds CSV-designated owners to the existing ManagedBy list.
+    Replace          — replaces ManagedBy entirely with the CSV-designated owners.
+
+.PARAMETER Notify
+    If specified, sends an email to each newly assigned owner informing them of their new role.
+    Requires app-based auth with -ClientSecret and the app to have the Mail.Send Graph permission.
+    Pair with -NotificationFrom to set the sender address.
+
+.PARAMETER NotificationFrom
+    Sender address for owner notification emails (requires a licensed mailbox).
+    Defaults to -AdminUPN when not specified. Only used when -Notify is set.
+
+.PARAMETER NotificationSubject
+    Subject line for notification emails. Supports the same placeholders as the body template:
+    {{GroupName}}, {{GroupEmail}}, {{OwnerEmail}}.
+    Defaults to: "You have been added as owner of distribution list: {{GroupName}}"
+
+.PARAMETER NotificationTemplatePath
+    Path to an external HTML file used as the email body.
+    Supports the following placeholders, replaced per email:
+        {{GroupName}}  — display name of the distribution list
+        {{GroupEmail}} — primary SMTP address of the distribution list
+        {{OwnerEmail}} — email address of the recipient (the newly assigned owner)
+    If omitted, the built-in template is used.
+    Copy notification-template.html from the script directory as a starting point.
 
 .PARAMETER AuditLogPath
     Path for the audit log CSV. Defaults to .\DLOwnerAssignment_<timestamp>.csv.
@@ -95,7 +118,12 @@ param(
     [string]$InputCsvPath,
 
     [ValidateSet('Replace', 'Append')]
-    [string]$Mode = 'Replace',
+    [string]$Mode = 'Append',
+
+    [switch]$Notify,
+    [string]$NotificationFrom,
+    [string]$NotificationSubject = 'You have been added as owner of distribution list: {{GroupName}}',
+    [string]$NotificationTemplatePath,
 
     [string]$AuditLogPath = ".\DLOwnerAssignment_$(Get-Date -Format 'yyyyMMdd_HHmmss').csv",
 
@@ -177,9 +205,154 @@ function Connect-ToExchangeOnline {
     Write-Log "Connected (module v$modVersion)." 'SUCCESS'
 }
 
+function Get-GraphToken {
+    # Returns an access token via client-credentials flow; $null when credentials are absent
+    # (caller falls back to Send-MgUserMail SDK path).
+    if (-not ($AppId -and $TenantId -and $ClientSecret)) { return $null }
+    try {
+        $body = @{
+            grant_type    = 'client_credentials'
+            client_id     = $AppId
+            client_secret = $ClientSecret
+            scope         = 'https://graph.microsoft.com/.default'
+        }
+        $resp = Invoke-RestMethod `
+            -Uri "https://login.microsoftonline.com/$TenantId/oauth2/v2.0/token" `
+            -Method POST -Body $body -ContentType 'application/x-www-form-urlencoded' `
+            -ErrorAction Stop
+        Write-Log 'Graph token acquired for notification emails.' 'SUCCESS'
+        return $resp.access_token
+    } catch {
+        Write-Log "Could not acquire Graph token — notifications disabled. $($_.Exception.Message)" 'WARN'
+        return $null
+    }
+}
+
+function Send-OwnerNotification {
+    param(
+        [string]$OwnerEmail,
+        [string]$GroupName,
+        [string]$GroupEmail,
+        [string]$FromEmail,
+        [string]$GraphToken,
+        [string]$Template,
+        [string]$Subject
+    )
+
+    $expandedSubject = $Subject `
+        -replace '\{\{GroupName\}\}',  $GroupName `
+        -replace '\{\{GroupEmail\}\}', $GroupEmail `
+        -replace '\{\{OwnerEmail\}\}', $OwnerEmail
+
+    $htmlBody = $Template `
+        -replace '\{\{GroupName\}\}',  $GroupName `
+        -replace '\{\{GroupEmail\}\}', $GroupEmail `
+        -replace '\{\{OwnerEmail\}\}', $OwnerEmail
+
+    if ($GraphToken) {
+        # App-based path: Graph REST API with client-credentials token
+        $payload = @{
+            message        = @{
+                subject      = $expandedSubject
+                body         = @{ contentType = 'HTML'; content = $htmlBody }
+                toRecipients = @(@{ emailAddress = @{ address = $OwnerEmail } })
+            }
+            saveToSentItems = $false
+        } | ConvertTo-Json -Depth 10
+
+        try {
+            Invoke-RestMethod `
+                -Uri "https://graph.microsoft.com/v1.0/users/$FromEmail/sendMail" `
+                -Method POST -Body $payload -ContentType 'application/json' `
+                -Headers @{ Authorization = "Bearer $GraphToken" } `
+                -ErrorAction Stop
+            Write-Log "    Notification sent → $OwnerEmail" 'INFO'
+        } catch {
+            Write-Log "    Notification FAILED → $OwnerEmail — $($_.Exception.Message)" 'WARN'
+        }
+    } elseif (Get-Command Send-MgUserMail -ErrorAction SilentlyContinue) {
+        # Interactive/delegated path: Microsoft.Graph SDK
+        try {
+            $msg = @{
+                Subject      = $expandedSubject
+                Body         = @{ ContentType = 'HTML'; Content = $htmlBody }
+                ToRecipients = @(@{ EmailAddress = @{ Address = $OwnerEmail } })
+            }
+            Send-MgUserMail -UserId $FromEmail -Message $msg -SaveToSentItems:$false -ErrorAction Stop
+            Write-Log "    Notification sent → $OwnerEmail" 'INFO'
+        } catch {
+            Write-Log "    Notification FAILED → $OwnerEmail — $($_.Exception.Message)" 'WARN'
+        }
+    } else {
+        Write-Log "    Notification skipped → $OwnerEmail (no Graph token and Microsoft.Graph module unavailable)" 'WARN'
+    }
+}
+
 # ─── Entry ───────────────────────────────────────────────────────────────────
 
 Connect-ToExchangeOnline -UPN $AdminUPN
+
+# ─── Notification setup ───────────────────────────────────────────────────────
+$graphToken           = $null
+$notificationTemplate = $null
+if ($Notify) {
+    if (-not $NotificationFrom -and $AdminUPN) { $NotificationFrom = $AdminUPN }
+    if (-not $NotificationFrom) {
+        Write-Error '-NotificationFrom (or -AdminUPN) is required when using -Notify.'
+        exit 1
+    }
+    if ($WhatIfPreference) {
+        Write-Log '-Notify: WhatIf mode — notification emails will not actually be sent.' 'WARN'
+    } elseif ($AppId -and $TenantId -and $ClientSecret) {
+        $graphToken = Get-GraphToken
+    } elseif (Get-Command Send-MgUserMail -ErrorAction SilentlyContinue) {
+        Write-Log '-Notify: no -ClientSecret — using Microsoft.Graph module (Send-MgUserMail).' 'INFO'
+        $ctx = Get-MgContext -ErrorAction SilentlyContinue
+        if (-not $ctx) {
+            Write-Log 'Connecting to Microsoft Graph (Mail.Send scope)...' 'INFO'
+            Connect-MgGraph -Scopes 'Mail.Send' -NoWelcome -ErrorAction Stop
+        }
+    } else {
+        Write-Log '-Notify requires either -ClientSecret (Graph REST) or the Microsoft.Graph module.' 'WARN'
+        Write-Log '  Install with: Install-Module Microsoft.Graph.Users.Actions -Scope CurrentUser' 'WARN'
+        $Notify = $false
+    }
+
+    # Validate the sender mailbox exists — Graph sendMail returns 404 if the sender
+    # is not a real, licensed user mailbox (e.g. a DL, contact, or non-existent address).
+    if ($Notify -and -not $WhatIfPreference) {
+        try {
+            $null = Get-Mailbox -Identity $NotificationFrom -ErrorAction Stop
+            Write-Log "Notification sender mailbox verified: $NotificationFrom" 'INFO'
+        } catch {
+            Write-Error "-NotificationFrom '$NotificationFrom' was not found or is not a user mailbox. Provide a licensed mailbox that exists in Exchange Online (e.g. your admin UPN). $($_.Exception.Message)"
+            exit 1
+        }
+    }
+
+    # Load email template
+    if ($NotificationTemplatePath) {
+        if (-not (Test-Path $NotificationTemplatePath)) {
+            Write-Error "Notification template not found: $NotificationTemplatePath"
+            exit 1
+        }
+        $notificationTemplate = Get-Content $NotificationTemplatePath -Raw -Encoding UTF8
+        Write-Log "Notification template loaded: $NotificationTemplatePath" 'INFO'
+    } else {
+        $notificationTemplate = @'
+<html><body>
+<p>Hi,</p>
+<p>You have been assigned as an <strong>owner</strong> of the following distribution list:</p>
+<table cellpadding="4" style="border-collapse:collapse">
+  <tr><td><strong>Display name</strong></td><td>{{GroupName}}</td></tr>
+  <tr><td><strong>Email address</strong></td><td>{{GroupEmail}}</td></tr>
+</table>
+<p>As an owner you can manage this list&rsquo;s membership and settings in Outlook or the Exchange admin center.</p>
+<p><em>This message was sent automatically by the DL Ownership Remediation tool.</em></p>
+</body></html>
+'@
+    }
+}
 
 #region --- Load and validate input CSV ---
 
@@ -277,6 +450,15 @@ foreach ($group in $groupedByDL) {
         })
 
         Write-Log "  [$i/$total] $action  $groupName  →  $ownerList" $(if ($action -eq 'Applied') { 'SUCCESS' } else { 'INFO' })
+
+        if ($action -eq 'Applied' -and $Notify) {
+            foreach ($owner in $newOwners) {
+                Send-OwnerNotification -OwnerEmail $owner -GroupName $groupName `
+                    -GroupEmail $dlEmail -FromEmail $NotificationFrom `
+                    -GraphToken $graphToken -Template $notificationTemplate `
+                    -Subject $NotificationSubject
+            }
+        }
 
     } catch {
         $errMsg = $_.Exception.Message
