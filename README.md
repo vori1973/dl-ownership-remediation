@@ -52,8 +52,10 @@ Install-Module ExchangeOnlineManagement -Scope CurrentUser
 Update-Module ExchangeOnlineManagement
 ```
 
-Minimum supported version: **3.0** (EXO v3, REST-based cmdlets).  
-Verify: `Get-Module ExchangeOnlineManagement -ListAvailable`
+Minimum supported version: **3.2.0** — required for the `-ClientSecret` parameter in `Connect-ExchangeOnline`.  
+Version 3.0–3.1 will connect with certificate auth but fail with *"A parameter cannot be found that matches parameter name 'ClientSecret'"* at runtime.  
+Verify: `Get-Module ExchangeOnlineManagement -ListAvailable`  
+Update: `Update-Module ExchangeOnlineManagement -Force`
 
 ---
 
@@ -91,6 +93,8 @@ After adding: click **Grant admin consent for \<tenant\>**.
 
 ### Assign Exchange directory role (Entra)
 
+> ✅ **This step can be completed in the browser (no PowerShell required).**
+
 The API permission above is not enough on its own. The service principal also needs
 an Exchange role assigned in Entra ID:
 
@@ -102,6 +106,10 @@ an Exchange role assigned in Entra ID:
 
 ### Assign Exchange Online RBAC role (required for write operations)
 
+> ⚠️ **This step requires PowerShell — there is no equivalent UI in the Exchange Admin Center.**  
+> The Exchange Admin Center does not support assigning management roles directly to a service
+> principal. `New-ManagementRoleAssignment -App` is PowerShell-only.
+
 The Entra directory role alone covers read operations and admin-center UI access.
 For app-only `Set-DistributionGroup` (and other write cmdlets), the service principal
 also needs an Exchange Online management **role** (not a role group) assigned directly.
@@ -112,12 +120,18 @@ also needs an Exchange Online management **role** (not a role group) assigned di
 
 Run this **once** as an Exchange admin.
 
+> **Important:** `Get-ServicePrincipal` and `New-ManagementRoleAssignment` are Exchange Online
+> cmdlets — they are only available **after** `Connect-ExchangeOnline` completes successfully.
+> Running them in a plain PowerShell session (without connecting first) produces
+> *"The term 'Get-ServicePrincipal' is not recognized"*.
+
 > **Important:** `-App` requires the service principal **Object ID**, not the Application (client) ID.  
 > Find it: Entra ID → Enterprise applications → your app → Overview → Object ID  
 > Or via PowerShell:  
 > `Get-MgServicePrincipal -Filter "AppId eq '<AppId>'" | Select-Object Id, DisplayName`
 
 ```powershell
+# Must connect interactively as admin first — these cmdlets require an active EXO session
 Connect-ExchangeOnline -UserPrincipalName admin@contoso.com
 
 # 1. Find (or register) the Exchange service principal
